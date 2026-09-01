@@ -1,5 +1,5 @@
 // temp_monitor.cpp
-// Reads /dev/tempsensor once a second, drives a small state machine
+// Opens /dev/tempsensor fresh each second, drives a small state machine
 // (NORMAL -> WARNING -> CRITICAL), and logs a message on every transition.
 //
 // Usage:
@@ -22,6 +22,8 @@
 #include <sys/ioctl.h>
 
 #include "../driver/tempsensor_ioctl.h"
+
+static const char *DEV_PATH = "/dev/tempsensor";
 
 enum class State { NORMAL, WARNING, CRITICAL };
 
@@ -50,16 +52,23 @@ static std::string timestamp()
     return std::string(buf);
 }
 
-static double read_temperature(int fd)
+// Opens the device, does exactly one read, closes it. Avoids relying on
+// lseek()/persistent file position, which plain character devices like
+// this one don't support.
+static double read_temperature()
 {
-    char buf[16] = {0};
-    if (lseek(fd, 0, SEEK_SET) < 0) {
-        perror("lseek");
+    int fd = open(DEV_PATH, O_RDONLY);
+    if (fd < 0) {
+        perror("open");
         return -1.0;
     }
+
+    char buf[16] = {0};
     ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+
     if (n <= 0) {
-        perror("read");
+        fprintf(stderr, "read returned %zd\n", n);
         return -1.0;
     }
     buf[n] = '\0';
@@ -68,15 +77,13 @@ static double read_temperature(int fd)
 
 int main(int argc, char *argv[])
 {
-    const char *dev_path = "/dev/tempsensor";
-    int fd = open(dev_path, O_RDONLY);
-    if (fd < 0) {
-        perror("open /dev/tempsensor (is the module loaded? are you root?)");
-        return 1;
-    }
-
     // --reset : one-shot ioctl, then exit
     if (argc == 2 && std::strcmp(argv[1], "--reset") == 0) {
+        int fd = open(DEV_PATH, O_RDONLY);
+        if (fd < 0) {
+            perror("open (is the module loaded? are you root?)");
+            return 1;
+        }
         if (ioctl(fd, TEMP_IOC_RESET) < 0) {
             perror("ioctl RESET");
             close(fd);
@@ -89,6 +96,11 @@ int main(int argc, char *argv[])
 
     // --drift N : set drift, then continue into the monitoring loop
     if (argc == 3 && std::strcmp(argv[1], "--drift") == 0) {
+        int fd = open(DEV_PATH, O_RDONLY);
+        if (fd < 0) {
+            perror("open (is the module loaded? are you root?)");
+            return 1;
+        }
         int drift = std::atoi(argv[2]);
         if (ioctl(fd, TEMP_IOC_SET_DRIFT, &drift) < 0) {
             perror("ioctl SET_DRIFT");
@@ -97,6 +109,17 @@ int main(int argc, char *argv[])
         }
         printf("[%s] Drift set to %.1f C per reading.\n",
                timestamp().c_str(), drift / 10.0);
+        close(fd);
+    }
+
+    // sanity check the device exists / is openable before starting the loop
+    {
+        int fd = open(DEV_PATH, O_RDONLY);
+        if (fd < 0) {
+            perror("open (is the module loaded? are you root?)");
+            return 1;
+        }
+        close(fd);
     }
 
     printf("[%s] Monitoring started. Press Ctrl+C to stop.\n",
@@ -106,7 +129,7 @@ int main(int argc, char *argv[])
     printf("[%s] Initial state: %s\n", timestamp().c_str(), state_name(current_state));
 
     while (true) {
-        double temp = read_temperature(fd);
+        double temp = read_temperature();
         if (temp < 0) {
             fprintf(stderr, "[%s] Failed to read sensor, retrying...\n",
                     timestamp().c_str());
@@ -127,6 +150,5 @@ int main(int argc, char *argv[])
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
-    close(fd);
     return 0;
 }
